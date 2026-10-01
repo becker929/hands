@@ -435,64 +435,6 @@ def profile_audio(
     return "\\n".join(lines)
 '''
 
-# ── run_shell_command source (custom Letta tool) ──────────────────────────────
-
-_RUN_SHELL_COMMAND_SOURCE = '''import json
-import os
-import urllib.error
-import urllib.request
-
-
-def run_shell_command(command: str) -> str:
-    """Execute a shell command on the host machine (cwd: hands/).
-
-    Use for: restarting Ableton, launching MCP server, running make targets,
-    checking git status, sleeping while Ableton boots, etc.
-
-    Common examples:
-      open -a "Ableton Live 12 Standard"   — restart Ableton
-      make start-ableton-mcp               — restart MCP bridge
-      git diff --name-only HEAD            — check changed files
-      sleep 15                             — wait for Ableton to boot
-
-    NOTE: Do NOT use this to restart the vibe server — use restart_vibe_server()
-    instead. Stopping vibe via /shell kills the server before the response is sent.
-
-    Args:
-        command: Shell command to execute. Runs with cwd = hands/ and timeout = 30s.
-
-    Returns:
-        JSON string with stdout, stderr, returncode, or error message.
-    """
-    vibe_url = os.environ.get("VIBE_SERVER_URL", "http://host.docker.internal:8080")
-    endpoint = vibe_url + "/shell"
-
-    payload = json.dumps({"command": command}).encode()
-    req = urllib.request.Request(
-        endpoint,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=35) as resp:
-            result = json.loads(resp.read())
-    except urllib.error.URLError as exc:
-        return "Could not reach vibe server at " + endpoint + ": " + str(exc)
-    except Exception as exc:
-        return "run_shell_command failed: " + str(exc)
-
-    if "error" in result:
-        return "Shell error: " + result["error"]
-    parts = []
-    if result.get("stdout"):
-        parts.append("stdout: " + result["stdout"].rstrip())
-    if result.get("stderr"):
-        parts.append("stderr: " + result["stderr"].rstrip())
-    parts.append("returncode: " + str(result.get("returncode", "?")))
-    return " | ".join(parts) if parts else "ok"
-'''
-
 # ── restart_vibe_server source (custom Letta tool) ────────────────────────────
 
 _RESTART_VIBE_SERVER_SOURCE = '''import json
@@ -508,9 +450,8 @@ def restart_vibe_server() -> str:
     or any other module loaded by the vibe server. The restart is non-blocking:
     the server shuts down and a fresh process starts in ~3-5 seconds.
 
-    Do NOT use run_shell_command("make start-vibe") for this — that command
-    cannot restart a server that is already running, and stopping then starting
-    via /shell kills the connection before the response is sent.
+    Do not try to restart it any other way: stopping the server kills the
+    connection before the response is sent.
 
     After calling this tool, wait ~5 seconds before issuing another command
     to give the new process time to bind its port.
@@ -663,12 +604,11 @@ script proceed?" — the human must click "Proceed". Warn them before MIDI write
 
 def _request(method: str, url: str, body: dict | None = None, timeout: int = 30) -> object:
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"} if data else {},
-        method=method,
-    )
+    headers = {"Content-Type": "application/json"} if data else {}
+    # Letta runs with a server password (Makefile: SECURE=true); send it.
+    if os.environ.get("LETTA_API_KEY"):
+        headers["Authorization"] = f"Bearer {os.environ['LETTA_API_KEY']}"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
@@ -768,25 +708,6 @@ def upsert_profile_audio(base_url: str) -> str:
     return tool["id"]
 
 
-# ── Step 1d: run_shell_command custom tool ────────────────────────────────────
-
-def upsert_run_shell_command(base_url: str) -> str:
-    tools = _request("GET", f"{base_url}/v1/tools/")
-    existing = [t for t in tools if t.get("name") == "run_shell_command"]
-    payload = {
-        "source_code": _RUN_SHELL_COMMAND_SOURCE,
-        "description": "Execute a shell command on the host machine via the vibe server (cwd: hands/)",
-    }
-    if existing:
-        _request("PATCH", f"{base_url}/v1/tools/{existing[0]['id']}", payload)
-        print(f"  ✓  run_shell_command updated ({existing[0]['id']})")
-        return existing[0]["id"]
-    payload["source_type"] = "python"
-    tool = _request("POST", f"{base_url}/v1/tools/", payload)
-    print(f"  ✓  run_shell_command created ({tool['id']})")
-    return tool["id"]
-
-
 # ── Step 1d: check_improvement custom tool ────────────────────────────────────
 
 def upsert_check_improvement(base_url: str) -> str:
@@ -828,20 +749,26 @@ def upsert_restart_vibe_server(base_url: str) -> str:
 def register_mcp_server(base_url: str, bridge_port: int) -> None:
     """Register (or update) the ableton-live MCP server config."""
     server_url = f"http://host.docker.internal:{bridge_port}/mcp"
+    token = os.environ.get("MCP_BRIDGE_TOKEN", "")
+    if not token:
+        raise SystemExit("MCP_BRIDGE_TOKEN is not set; the bridge refuses unauthenticated requests.")
+    # The bridge runs arbitrary Python in Live, so Letta must present the token.
+    auth = {"auth_header": "Authorization", "auth_token": f"Bearer {token}",
+            "custom_headers": {"Authorization": f"Bearer {token}"}}
     # GET returns a dict keyed by server_name
     existing = _request("GET", f"{base_url}/v1/tools/mcp/servers")
     registered = isinstance(existing, dict) and "ableton-live" in existing
 
     if registered:
         _request("PATCH", f"{base_url}/v1/tools/mcp/servers/ableton-live", {
-            "server_url": server_url,
+            "server_url": server_url, **auth,
         })
         print(f"  ✓  ableton-live MCP server updated → {server_url}")
     else:
         _request("PUT", f"{base_url}/v1/tools/mcp/servers", {
             "server_name": "ableton-live",
             "type": "streamable_http",
-            "server_url": server_url,
+            "server_url": server_url, **auth,
         })
         print(f"  ✓  ableton-live MCP server registered → {server_url}")
 
@@ -1175,9 +1102,6 @@ def main() -> None:
     print("\n── Step 1b-alt2: profile_audio custom tool ──────────────")
     profile_id = upsert_profile_audio(args.base_url)
 
-    print("\n── Step 1c: run_shell_command custom tool ───────────────")
-    shell_id = upsert_run_shell_command(args.base_url)
-
     print("\n── Step 1d: check_improvement custom tool ───────────────")
     check_id = upsert_check_improvement(args.base_url)
 
@@ -1195,7 +1119,6 @@ def main() -> None:
         + ([improve_id] if improve_id else [])
         + ([analyze_id] if analyze_id else [])
         + ([profile_id] if profile_id else [])
-        + ([shell_id] if shell_id else [])
         + ([check_id] if check_id else [])
         + ([restart_id] if restart_id else [])
         + mcp_ids
@@ -1235,7 +1158,6 @@ def main() -> None:
         "   profile_audio       — full ears AudioProfile: spectral + DCLAP embedding\n"
         "   request_improvement — start async harness improvement (returns immediately)\n"
         "   check_improvement   — poll status of the most recent improvement job\n"
-        "   run_shell_command   — execute shell commands on the host (cwd: hands/)\n"
         "   [block] ableton_rules  — crash rules always in context\n"
         "   [block] harness_rules  — self-improvement guide always in context\n"
         "   [source] ableton-guide — full LOM guide, semantically searchable\n\n"

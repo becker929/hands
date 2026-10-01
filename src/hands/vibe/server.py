@@ -12,7 +12,6 @@ Endpoints:
   GET  /self-improve/stream   → SSE stream of live SDK log lines + final status
   GET  /sdk-log               → raw SDK session log file (text)
   POST /restart               → detached self-restart (responds before dying)
-  POST /shell                 → execute a shell command, return stdout/stderr/returncode
 
 No FastAPI dependency — uses the stdlib http.server only.
 Letta integration is optional: imported lazily; falls back to JSON-file logging.
@@ -27,9 +26,18 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
+import hmac as _hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+_os_environ_get = os.environ.get
+_ALLOWED_ORIGIN = os.environ.get("VIBE_ALLOWED_ORIGIN", "http://localhost:3000")
+# Host names a request may address. Anything else is a DNS-rebinding attempt.
+# host.docker.internal is how Letta (in Docker) reaches the server.
+_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "host.docker.internal",
+                  *filter(None, os.environ.get("VIBE_ALLOWED_HOSTS", "").split(","))}
+_MAX_BODY = 1_000_000
 
 
 class VibeServer:
@@ -467,33 +475,6 @@ class VibeServer:
             "message": "Vibe server restarting. Wait ~5s then verify with a command.",
         }
 
-    def handle_shell(self, body: dict) -> dict:
-        """Execute a shell command and return stdout/stderr/returncode."""
-        import subprocess
-
-        cmd = body.get("command", "").strip()
-        if not cmd:
-            return {"error": "command is required"}
-
-        try:
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                cwd="/Users/anthonybecker/Desktop/agent-sandbox/hands",
-            )
-            return {
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "returncode": result.returncode,
-            }
-        except subprocess.TimeoutExpired:
-            return {"error": "command timed out after 30s"}
-        except Exception as exc:
-            return {"error": str(exc)}
-
     _ALL_FIELDS = frozenset(
         ["lufs", "spectral_centroid_hz", "peak_frequency_hz", "energy_by_band", "spectrum"]
     )
@@ -782,9 +763,48 @@ class VibeServer:
             # ── CORS helpers ────────────────────────────────────────────────
 
             def _add_cors(self) -> None:
-                self.send_header("Access-Control-Allow-Origin", "*")
+                # Only the local chat UI may call from a browser. "*" let any
+                # web page the user visited drive this server.
+                self.send_header("Access-Control-Allow-Origin", _ALLOWED_ORIGIN)
+                self.send_header("Vary", "Origin")
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+            def _guard(self) -> bool:
+                """Reject rebinding, cross-site and (when tunnelled) anonymous requests.
+
+                Returns True when the request may proceed; otherwise it has
+                already been answered.
+                """
+                host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+                if host not in _ALLOWED_HOSTS:
+                    self._send_json({"error": "forbidden host"}, 403)
+                    return False
+                origin = self.headers.get("Origin")
+                if origin and origin != _ALLOWED_ORIGIN:
+                    self._send_json({"error": "forbidden origin"}, 403)
+                    return False
+                if self.command == "POST" and not (self.headers.get("Content-Type") or "").startswith("application/json"):
+                    # Cross-site "simple" requests (text/plain) skip CORS preflight.
+                    self._send_json({"error": "Content-Type must be application/json"}, 415)
+                    return False
+                if _os_environ_get("VIBE_TUNNEL") and not self._authorized():
+                    # Tunnelled means public: every endpoint needs the token.
+                    self._refuse()
+                    return False
+                return True
+
+            def _authorized(self) -> bool:
+                """True only when VIBE_TOKEN is set and the request carries it."""
+                token = _os_environ_get("VIBE_TOKEN")
+                sent = self.headers.get("Authorization", "")
+                return bool(token) and _hmac.compare_digest(sent, "Bearer " + token)
+
+            def _refuse(self) -> None:
+                self._send_json(
+                    {"error": "forbidden: set VIBE_TOKEN and send 'Authorization: Bearer <token>'"},
+                    403,
+                )
 
             def do_OPTIONS(self) -> None:  # noqa: N802
                 self.send_response(204)
@@ -794,7 +814,7 @@ class VibeServer:
             # ── Request helpers ─────────────────────────────────────────────
 
             def _read_body(self) -> dict:
-                length = int(self.headers.get("Content-Length", 0))
+                length = min(int(self.headers.get("Content-Length", 0) or 0), _MAX_BODY)
                 raw = self.rfile.read(length) if length else b"{}"
                 try:
                     return json.loads(raw)
@@ -835,6 +855,8 @@ class VibeServer:
             # ── Route handlers ──────────────────────────────────────────────
 
             def do_GET(self) -> None:  # noqa: N802
+                if not self._guard():
+                    return
                 if self.path == "/session":
                     self._send_json(server.get_session())
                     return
@@ -892,6 +914,11 @@ class VibeServer:
                 self._send_json({"error": "not found"}, 404)
 
             def do_DELETE(self) -> None:  # noqa: N802
+                if not self._guard():
+                    return
+                if not self._authorized():
+                    self._refuse()
+                    return
                 if self.path.startswith("/self-improve/queue/"):
                     queue_id = self.path[len("/self-improve/queue/"):]
                     if not queue_id or "/" in queue_id:
@@ -902,17 +929,20 @@ class VibeServer:
                 self._send_json({"error": "not found"}, 404)
 
             def do_POST(self) -> None:  # noqa: N802
+                if not self._guard():
+                    return
                 body = self._read_body()
                 if self.path == "/bounce":
                     self._send_json(server.handle_bounce(body))
                 elif self.path == "/feedback":
                     self._send_json(server.handle_feedback(body))
+                elif self.path in ("/self-improve", "/restart") and not self._authorized():
+                    # Both change or restart the running code.
+                    self._refuse()
                 elif self.path == "/self-improve":
                     self._send_json(server.handle_self_improve(body))
                 elif self.path == "/restart":
                     self._send_json(server.handle_restart())
-                elif self.path == "/shell":
-                    self._send_json(server.handle_shell(body))
                 elif self.path == "/analyze":
                     self._send_json(server.handle_analyze(body))
                 elif self.path == "/profile":
@@ -926,17 +956,20 @@ class VibeServer:
     # Serve
     # ------------------------------------------------------------------
 
-    def serve(self, port: int = 8080) -> None:
-        """Start the HTTP server (blocks until interrupted)."""
-        httpd = ThreadingHTTPServer(("0.0.0.0", port), self._make_handler())
-        print(f"  [vibe] listening on http://0.0.0.0:{port}")
+    def serve(self, port: int = 8080, host: str = "127.0.0.1") -> None:
+        """Start the HTTP server (blocks until interrupted).
+
+        Binds to loopback by default. Docker Desktop still reaches it via
+        host.docker.internal; pass host="0.0.0.0" only on a trusted network.
+        """
+        httpd = ThreadingHTTPServer((host, port), self._make_handler())
+        print(f"  [vibe] listening on http://{host}:{port}")
         print(f"  [vibe] session: {self._session_id}")
         print(f"  [vibe] output:  {self._output_dir}")
         print("  [vibe] POST /self-improve          — start async improvement job (returns immediately)")
         print("  [vibe] GET  /self-improve/status   — poll job status")
         print("  [vibe] GET  /self-improve/stream   — SSE live progress stream")
         print("  [vibe] POST /restart               — detached self-restart")
-        print("  [vibe] POST /shell                 — execute a shell command (cwd: hands/)")
         print("  [vibe] POST /analyze               — spectral analysis: LUFS, FFT, energy bands (cached, supports ?fields)")
         print("  [vibe] POST /profile               — full ears AudioProfile: spectral + loudness + DCLAP embedding (subprocess)")
         if self._letta_client is None:

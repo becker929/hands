@@ -1,3 +1,5 @@
+> **Archived 30 September 2026.** Development continues in [zpkt](https://github.com/becker929/zpkt), at `hands/`. History was carried over with the code. Before archiving, the security fixes made in zpkt were applied here (services bound to loopback, authentication added, unsafe input handling fixed). Even so, do not run this code exposed to a network.
+
 # hands — DAW Control Layer
 
 `hands` gives the agent fine-grained control over Ableton Live 12. It owns
